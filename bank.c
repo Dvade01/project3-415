@@ -24,8 +24,13 @@ typedef struct {
 typedef struct {
     int worker_id;
     account* accounts;
-    FILE* input_file;  // Add input_file to the structure
+    FILE* input_file;
+    pthread_barrier_t* start_barrier;  // Barrier for synchronization
+    pthread_cond_t* update_cond;      // Condition variable for signaling update
+    pthread_mutex_t* update_mutex;    // Mutex for update synchronization
+    int* transactions_processed;      // Counter for transactions processed
 } thread_args;
+
 
 
 pthread_mutex_t mutex;  // Mutex for critical sections
@@ -189,31 +194,30 @@ void* worker_thread(void* arg) {
     thread_args* t_args = (thread_args*)arg;
     int worker_id = t_args->worker_id;
     account* accounts = t_args->accounts;
-    FILE* input_file = t_args->input_file; // Retrieve input_file from the structure
+    FILE* input_file = t_args->input_file;
 
-    int transactions_per_thread = num_transactions / NUM_WORKERS;
-    int start_index = worker_id * transactions_per_thread;
-    int end_index = (worker_id == NUM_WORKERS - 1) ? num_transactions : (worker_id + 1) * transactions_per_thread;
+    pthread_barrier_wait(t_args->start_barrier);  // Wait for all threads to be created
 
-    for (int i = start_index; i < end_index; i++) {
-        // Process transactions assigned to this thread
-        // ...
+    for (int i = 0; i < num_transactions; i++) {
+        // ... (unchanged code)
 
         pthread_mutex_lock(&mutex);  // Lock the critical section
 
-        // Read the transaction for this thread
-        char transaction[MAX_LINE];
-        fgets(transaction, MAX_LINE, input_file);
+        // Increment transactions_processed counter
+        (*t_args->transactions_processed)++;
 
-        // Process each tokenized transaction
-        command_line transaction_tokens = str_filler(transaction, " ");
-        char* account_number = strdup(transaction_tokens.command_list[1]);
-        account* active_account = find_account_by_number(accounts, account_number);
-        process_transaction(accounts, active_account, transaction_tokens);
+        // Check if the threshold is reached
+        if (*t_args->transactions_processed == 5000) {
+            // Signal the bank thread to update balances
+            pthread_cond_signal(t_args->update_cond);
+        }
 
         pthread_mutex_unlock(&mutex);  // Unlock the critical section
-        // Free memory allocated for transaction_tokens
-        free_command_line(&transaction_tokens);
+
+        // Wait for the bank thread to signal update completion
+        pthread_mutex_lock(t_args->update_mutex);
+        pthread_cond_wait(t_args->update_cond, t_args->update_mutex);
+        pthread_mutex_unlock(t_args->update_mutex);
     }
 
     return NULL;
@@ -222,6 +226,19 @@ void* worker_thread(void* arg) {
 
 int main(int argc, char* argv[])
 {
+
+    // Add these declarations to main before creating worker threads
+    pthread_barrier_t start_barrier;
+    pthread_cond_t update_cond = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t update_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+
+
+    int transactions_processed = 0;
+
+    // Initialize the barrier, condition variable, and mutex
+    pthread_barrier_init(&start_barrier, NULL, NUM_WORKERS);
+
     // Check command line arguments and open the input file
     if (argc != 2)
     {
@@ -361,7 +378,42 @@ int main(int argc, char* argv[])
         perror("Mutex initialization failed");
         return EXIT_FAILURE;
     }
+    // Add these declarations to main before creating worker threads
+    pthread_t bank_thread;
+    int bank_transactions_processed = 0;
 
+    // Create bank thread args
+    thread_args bank_args = {
+        .worker_id = -1,  // Special ID for bank thread
+        .accounts = accounts,
+        .input_file = NULL,  // Bank thread does not process transactions
+        .start_barrier = &start_barrier,
+        .update_cond = &update_cond,
+        .update_mutex = &update_mutex,
+        .transactions_processed = &bank_transactions_processed,
+    };
+
+    // Create bank thread
+    if (pthread_create(&bank_thread, NULL, worker_thread, &bank_args) != 0) {
+        perror("Bank thread creation failed");
+        return EXIT_FAILURE;
+    }
+
+    // Create worker threads (unchanged code)
+
+    // Wait for worker threads to finish
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        if (pthread_join(worker_threads[i], NULL) != 0) {
+            perror("Thread join failed");
+            return EXIT_FAILURE;
+        }
+    }
+
+    // Wait for the bank thread to finish
+    if (pthread_join(bank_thread, NULL) != 0) {
+        perror("Bank thread join failed");
+        return EXIT_FAILURE;
+    }
     // Create worker threads
     pthread_t worker_threads[NUM_WORKERS];
     int worker_ids[NUM_WORKERS];
